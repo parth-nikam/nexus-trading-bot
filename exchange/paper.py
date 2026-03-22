@@ -7,13 +7,13 @@ import time
 import uuid
 import aiohttp
 from typing import Optional
-from collections import defaultdict
 
 import config
 from exchange.base import (
     AbstractExchange, Order, OrderSide, OrderType, OrderStatus, Balance, Position
 )
 from utils.logger import get_logger
+from utils.retry import retry
 
 logger = get_logger(__name__)
 
@@ -45,9 +45,11 @@ class PaperExchange(AbstractExchange):
             self._session = aiohttp.ClientSession()
         return self._session
 
-    async def _get(self, path: str, params: dict = None) -> dict | list:
+    @retry(max_attempts=3, base_delay=1.0, exceptions=(aiohttp.ClientError, Exception))
+    async def _get(self, path: str, params: dict = None, base: str = None) -> dict | list:
         session = await self._session_get()
-        async with session.get(f"{self._base_url}{path}", params=params) as r:
+        url = (base or self._base_url) + path
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
             r.raise_for_status()
             return await r.json()
 
@@ -57,7 +59,7 @@ class PaperExchange(AbstractExchange):
         data = await self._get("/api/v3/klines", {
             "symbol": symbol, "interval": interval, "limit": limit
         })
-        return [
+        candles = [
             {
                 "time":   row[0],
                 "open":   float(row[1]),
@@ -68,6 +70,15 @@ class PaperExchange(AbstractExchange):
             }
             for row in data
         ]
+        # Validate continuity — warn if gaps detected
+        if len(candles) > 1:
+            times = [c["time"] for c in candles]
+            diffs = [times[i+1] - times[i] for i in range(len(times)-1)]
+            expected = diffs[0]
+            gaps = sum(1 for d in diffs if d > expected * 1.5)
+            if gaps:
+                logger.warning(f"[{symbol}] {gaps} candle gap(s) detected in {len(candles)} bars")
+        return candles
 
     async def get_ticker(self, symbol: str) -> float:
         data = await self._get("/api/v3/ticker/price", {"symbol": symbol})
@@ -83,7 +94,8 @@ class PaperExchange(AbstractExchange):
     async def get_funding_rate(self, symbol: str) -> float:
         """Binance perpetual funding rate — useful for carry signals."""
         try:
-            data = await self._get("/fapi/v1/premiumIndex", {"symbol": symbol})
+            data = await self._get("/fapi/v1/premiumIndex", {"symbol": symbol},
+                                   base="https://fapi.binance.com")
             return float(data.get("lastFundingRate", 0))
         except Exception:
             return 0.0
@@ -155,13 +167,14 @@ class PaperExchange(AbstractExchange):
         order.fee        = fee
 
         self._trade_log.append({
-            "id":         order.order_id,
-            "symbol":     order.symbol,
-            "side":       order.side.value,
-            "qty":        order.quantity,
-            "price":      fill_price,
-            "fee":        fee,
-            "timestamp":  order.timestamp,
+            "id":        order.order_id,
+            "symbol":    order.symbol,
+            "side":      order.side.value,
+            "qty":       order.quantity,
+            "price":     fill_price,
+            "fee":       fee,
+            "timestamp": order.timestamp,
+            "strategy":  getattr(order, "strategy", "unknown"),
         })
 
         logger.info(
