@@ -32,14 +32,14 @@ class EMARibbon(BaseStrategy):
         vol_ok  = vol_now > vol_avg * 0.8  # at least 80% of average
 
         if bull == 4:
-            conf = min(1.0, 0.65 + abs(slope) * 5)
+            conf = min(0.85, 0.60 + abs(slope) * 3)
             if vol_ok:
-                conf = min(1.0, conf + 0.1)
+                conf = min(0.85, conf + 0.05)
             return Vote("BUY",  conf, f"ribbon=bull slope={slope:.3f}%")
         if bear == 4:
-            conf = min(1.0, 0.65 + abs(slope) * 5)
+            conf = min(0.85, 0.60 + abs(slope) * 3)
             if vol_ok:
-                conf = min(1.0, conf + 0.1)
+                conf = min(0.85, conf + 0.05)
             return Vote("SELL", conf, f"ribbon=bear slope={slope:.3f}%")
 
         # Partial alignment with strong slope

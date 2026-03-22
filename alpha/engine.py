@@ -169,18 +169,13 @@ class AlphaEngine:
             score  = 0.0
             quality = 0.0
 
-        # Consecutive signal filter — require 2 consecutive same-direction signals
-        # This eliminates single-candle noise spikes
+        # Track consecutive signals for logging/metrics only (no blocking)
         if signal != HOLD:
             prev = self._consecutive.get(symbol, [HOLD, 0])
             if prev[0] == signal:
                 self._consecutive[symbol] = [signal, prev[1] + 1]
             else:
                 self._consecutive[symbol] = [signal, 1]
-                # First occurrence — downgrade to HOLD, wait for confirmation
-                logger.debug(f"[{symbol}] {signal} first occurrence — waiting for confirmation")
-                signal = HOLD
-                score  = 0.0
         else:
             self._consecutive[symbol] = [HOLD, 0]
 
