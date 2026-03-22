@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nexus Trading System</title>
+<style>
+  :root {
+    --bg: #0d0f14; --card: #161b22; --border: #30363d;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922;
+    --blue: #58a6ff; --text: #e6edf3; --muted: #8b949e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 18px; color: var(--blue); letter-spacing: 2px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; padding: 20px 24px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+  .card .value { font-size: 22px; font-weight: 700; }
+  .pos { color: var(--green); } .neg { color: var(--red); } .neu { color: var(--blue); }
+  .section { padding: 0 24px 20px; }
+  .section h2 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-size: 11px; text-transform: uppercase; }
+  .controls { padding: 0 24px 24px; display: flex; gap: 10px; flex-wrap: wrap; }
+  button { padding: 8px 20px; border: none; border-radius: 6px; cursor: pointer; font-family: inherit; font-size: 13px; font-weight: 600; }
+  .btn-buy  { background: var(--green); color: #000; }
+  .btn-sell { background: var(--red);   color: #fff; }
+  .btn-halt { background: var(--yellow); color: #000; }
+  select { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; font-family: inherit; }
+  #log { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; height: 120px; overflow-y: auto; font-size: 11px; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="dot" id="statusDot"></div>
+  <h1>NEXUS</h1>
+  <span id="statusText" style="color:var(--muted);font-size:11px;">connecting...</span>
+</header>
+
+<div class="grid">
+  <div class="card"><div class="label">Portfolio Value</div><div class="value neu" id="pv">—</div></div>
+  <div class="card"><div class="label">Total PnL</div><div class="value" id="pnl">—</div></div>
+  <div class="card"><div class="label">Win Rate</div><div class="value" id="wr">—</div></div>
+  <div class="card"><div class="label">Drawdown</div><div class="value" id="dd">—</div></div>
+  <div class="card"><div class="label">Cycle</div><div class="value neu" id="cycle">—</div></div>
+  <div class="card"><div class="label">Open Positions</div><div class="value" id="openCount">—</div></div>
+</div>
+
+<div class="section">
+  <h2>Open Positions</h2>
+  <table>
+    <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Current</th><th>Unrealized PnL</th></tr></thead>
+    <tbody id="posTable"><tr><td colspan="6" style="color:var(--muted)">No open positions</td></tr></tbody>
+  </table>
+</div>
+
+<div class="section">
+  <h2>Recent Trades</h2>
+  <table>
+    <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th></tr></thead>
+    <tbody id="tradeTable"><tr><td colspan="5" style="color:var(--muted)">No trades yet</td></tr></tbody>
+  </table>
+</div>
+
+<div class="controls">
+  <select id="symbolSelect">
+    <option value="BTCUSDT">BTCUSDT</option>
+    <option value="ETHUSDT">ETHUSDT</option>
+  </select>
+  <button class="btn-buy"  onclick="sendControl('buy')">▲ FORCE BUY</button>
+  <button class="btn-sell" onclick="sendControl('sell')">▼ FORCE SELL</button>
+  <button class="btn-halt" onclick="sendControl('halt')">⏹ HALT BOT</button>
+</div>
+
+<div class="section">
+  <h2>Activity Log</h2>
+  <div id="log"></div>
+</div>
+
+<script>
+const ws = new WebSocket(`ws://${location.host}/ws`);
+const dot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+
+ws.onopen = () => {
+  dot.style.background = 'var(--green)';
+  statusText.textContent = 'live';
+  log('WebSocket connected');
+};
+ws.onclose = () => {
+  dot.style.background = 'var(--red)';
+  statusText.textContent = 'disconnected';
+};
+ws.onmessage = (e) => {
+  const d = JSON.parse(e.data);
+  set('pv',    `$${d.portfolio_value?.toLocaleString() ?? '—'}`);
+  const pnl = d.total_pnl ?? 0;
+  const pnlEl = document.getElementById('pnl');
+  pnlEl.textContent = `${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}`;
+  pnlEl.className = `value ${pnl >= 0 ? 'pos' : 'neg'}`;
+  set('wr',    `${((d.win_rate ?? 0) * 100).toFixed(1)}%`);
+  const dd = d.drawdown_pct ?? 0;
+  const ddEl = document.getElementById('dd');
+  ddEl.textContent = `${dd.toFixed(2)}%`;
+  ddEl.className = `value ${dd > 5 ? 'neg' : 'pos'}`;
+  set('cycle', d.cycle ?? '—');
+};
+
+function set(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val;
+}
+
+function log(msg) {
+  const el = document.getElementById('log');
+  const ts = new Date().toLocaleTimeString();
+  el.innerHTML += `<div>[${ts}] ${msg}</div>`;
+  el.scrollTop = el.scrollHeight;
+}
+
+async function sendControl(action) {
+  const symbol = document.getElementById('symbolSelect').value;
+  const res = await fetch('/api/control', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action, symbol}),
+  });
+  const data = await res.json();
+  log(`Control: ${JSON.stringify(data)}`);
+}
+
+// Poll positions + trades every 5s
+async function refreshTables() {
+  try {
+    const [pos, trades] = await Promise.all([
+      fetch('/api/positions').then(r => r.json()),
+      fetch('/api/trades').then(r => r.json()),
+    ]);
+
+    const posTable = document.getElementById('posTable');
+    const entries = Object.entries(pos);
+    set('openCount', entries.length);
+    if (entries.length === 0) {
+      posTable.innerHTML = '<tr><td colspan="6" style="color:var(--muted)">No open positions</td></tr>';
+    } else {
+      posTable.innerHTML = entries.map(([sym, p]) => `
+        <tr>
+          <td>${sym}</td>
+          <td style="color:${p.side==='BUY'?'var(--green)':'var(--red)'}">${p.side}</td>
+          <td>${p.quantity?.toFixed(6)}</td>
+          <td>${p.entry_price?.toFixed(4)}</td>
+          <td>${p.current_price?.toFixed(4)}</td>
+          <td style="color:${p.unrealized_pnl>=0?'var(--green)':'var(--red)'}">${p.unrealized_pnl?.toFixed(4)}</td>
+        </tr>`).join('');
+    }
+
+    const tradeTable = document.getElementById('tradeTable');
+    const recent = trades.slice(-10).reverse();
+    if (recent.length === 0) {
+      tradeTable.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">No trades yet</td></tr>';
+    } else {
+      tradeTable.innerHTML = recent.map(t => `
+        <tr>
+          <td>${t.symbol}</td>
+          <td style="color:${t.side==='BUY'?'var(--green)':'var(--red)'}">${t.side}</td>
+          <td>${t.qty?.toFixed(6)}</td>
+          <td>${t.price?.toFixed(4)}</td>
+          <td>${t.fee?.toFixed(4)}</td>
+        </tr>`).join('');
+    }
+  } catch(e) { log(`Error: ${e.message}`); }
+}
+
+setInterval(refreshTables, 5000);
+refreshTables();
+</script>
+</body>
+</html>
