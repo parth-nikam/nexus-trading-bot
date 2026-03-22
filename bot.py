@@ -66,6 +66,7 @@ class NexusBot:
         logger.info(f"  Symbols  : {config.SYMBOLS}")
         logger.info(f"  Mode     : {'PAPER' if config.PAPER_TRADING else '*** LIVE ***'}")
         logger.info(f"  Capital  : ${config.INITIAL_CAPITAL:,.0f}")
+        logger.info(f"  Leverage : {config.LEVERAGE}x")
         logger.info(f"  Dashboard: http://localhost:{config.DASHBOARD_PORT}")
         logger.info("=" * 60)
 

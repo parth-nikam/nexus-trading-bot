@@ -139,19 +139,35 @@ class PaperExchange(AbstractExchange):
 
         if order.side == OrderSide.BUY:
             total_cost = cost + fee
-            if usdt < total_cost:
-                logger.warning(
-                    f"[PAPER] Insufficient USDT: need {total_cost:.2f}, have {usdt:.2f}"
+            # Check if this is closing a short position
+            existing = self._positions.get(order.symbol)
+            if existing and existing.side == OrderSide.SELL:
+                # Closing short: buy back asset, return borrowed, realize PnL
+                if usdt < total_cost:
+                    logger.warning(
+                        f"[PAPER] Insufficient USDT to close short: need {total_cost:.2f}, have {usdt:.2f}"
+                    )
+                    order.status = OrderStatus.CANCELLED
+                    return
+                self._balances["USDT"] = usdt - total_cost
+                self._balances[asset]  = max(0.0, self._balances.get(asset, 0) - order.quantity)
+                pos = self._positions.pop(order.symbol)
+                realized = (pos.entry_price - fill_price) * order.quantity - fee
+                logger.info(f"[PAPER] Short closed | PnL={realized:+.4f} USDT")
+            else:
+                if usdt < total_cost:
+                    logger.warning(
+                        f"[PAPER] Insufficient USDT: need {total_cost:.2f}, have {usdt:.2f}"
+                    )
+                    order.status = OrderStatus.CANCELLED
+                    return
+                self._balances["USDT"] = usdt - total_cost
+                self._balances[asset]  = self._balances.get(asset, 0) + order.quantity
+                self._positions[order.symbol] = Position(
+                    symbol=order.symbol, side=OrderSide.BUY,
+                    quantity=order.quantity, entry_price=fill_price,
+                    current_price=fill_price,
                 )
-                order.status = OrderStatus.CANCELLED
-                return
-            self._balances["USDT"] = usdt - total_cost
-            self._balances[asset]  = self._balances.get(asset, 0) + order.quantity
-            self._positions[order.symbol] = Position(
-                symbol=order.symbol, side=OrderSide.BUY,
-                quantity=order.quantity, entry_price=fill_price,
-                current_price=fill_price,
-            )
 
         else:  # SELL
             asset_bal = self._balances.get(asset, 0)
@@ -160,6 +176,20 @@ class PaperExchange(AbstractExchange):
                 pos_qty = self._positions.get(order.symbol)
                 if pos_qty:
                     order.quantity = pos_qty.quantity
+                    asset_bal = order.quantity
+                elif config.LEVERAGE > 1:
+                    # Leveraged short — borrow the asset (paper trading)
+                    # Deduct USDT margin, track short position
+                    margin = cost / config.LEVERAGE
+                    if self._balances.get("USDT", 0) < margin:
+                        logger.warning(
+                            f"[PAPER] Insufficient USDT for short margin: "
+                            f"need {margin:.2f}, have {self._balances.get('USDT',0):.2f}"
+                        )
+                        order.status = OrderStatus.CANCELLED
+                        return
+                    # Borrow asset and immediately sell it
+                    self._balances[asset] = order.quantity  # synthetic borrow
                     asset_bal = order.quantity
                 else:
                     logger.warning(
@@ -175,6 +205,13 @@ class PaperExchange(AbstractExchange):
                 pos = self._positions.pop(order.symbol)
                 realized = (fill_price - pos.entry_price) * order.quantity - fee
                 logger.info(f"[PAPER] Position closed | PnL={realized:+.4f} USDT")
+            else:
+                # Opening a short position
+                self._positions[order.symbol] = Position(
+                    symbol=order.symbol, side=OrderSide.SELL,
+                    quantity=order.quantity, entry_price=fill_price,
+                    current_price=fill_price,
+                )
 
         order.status     = OrderStatus.FILLED
         order.filled_qty = order.quantity

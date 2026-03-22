@@ -30,18 +30,20 @@ class TradeRecord:
     symbol:        str
     side:          str
     entry_price:   float
-    quantity:      float
+    quantity:      float       # leveraged quantity (notional / price)
+    margin:        float       # actual capital locked (notional / leverage)
     stop_loss:     float
     take_profit:   float
-    strategy:      str   = "unknown"   # attribution
+    leverage:      int   = 1
+    strategy:      str   = "unknown"
     entry_time:    float = field(default_factory=time.time)
     exit_price:    float = 0.0
     pnl:           float = 0.0
     hold_seconds:  float = 0.0
     open:          bool  = True
-    trail_active:  bool  = False       # trailing stop activated
-    trail_stop:    float = 0.0         # current trailing stop level
-    peak_price:    float = 0.0         # highest (BUY) or lowest (SELL) seen
+    trail_active:  bool  = False
+    trail_stop:    float = 0.0
+    peak_price:    float = 0.0
 
 
 @dataclass
@@ -101,6 +103,7 @@ class PortfolioRisk:
 
     def __init__(self, initial_capital: float):
         self._capital        = initial_capital
+        self._initial_capital = initial_capital
         self._peak_capital   = initial_capital
         self._daily_start    = initial_capital
         self._daily_reset    = time.time()
@@ -139,6 +142,11 @@ class PortfolioRisk:
 
             if len(self._open_trades) >= config.MAX_POSITIONS:
                 return False, f"max_positions:{config.MAX_POSITIONS}"
+
+            # Need at least TRADE_SIZE_PCT of capital available as margin
+            min_margin = self._capital * config.TRADE_SIZE_PCT * 0.5
+            if self._capital < min_margin:
+                return False, f"insufficient_capital:{self._capital:.2f}"
 
             daily_loss_pct = (self._daily_start - self._capital) / self._daily_start * 100
             if daily_loss_pct >= config.MAX_DAILY_LOSS_PCT:
@@ -200,24 +208,24 @@ class PortfolioRisk:
         realized_vol: Optional[float] = None,
     ) -> float:
         """
-        Kelly-sized position with volatility scaling.
-        High vol → smaller size. Low vol → slightly larger.
+        Kelly-sized position with volatility scaling and leverage.
+        Notional = margin × leverage. Returns quantity = notional / price.
         """
         base_f = kelly_f or config.TRADE_SIZE_PCT
 
         # Volatility adjustment
         if realized_vol is not None and realized_vol > 0:
             if realized_vol > config.VOL_SCALE_HIGH:
-                # Scale down proportionally — cap at 50% reduction
                 scale = max(0.5, config.VOL_SCALE_HIGH / realized_vol)
                 base_f *= scale
             elif realized_vol < config.VOL_SCALE_LOW:
-                # Scale up slightly — cap at 25% increase
                 scale = min(1.25, config.VOL_SCALE_LOW / realized_vol)
                 base_f *= scale
 
-        usable = self._capital * min(base_f, config.TRADE_SIZE_PCT * 2)
-        return usable / price if price > 0 else 0.0
+        leverage = getattr(config, "LEVERAGE", 1)
+        margin   = self._capital * min(base_f, config.TRADE_SIZE_PCT * 2)
+        notional = margin * leverage
+        return notional / price if price > 0 else 0.0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -229,18 +237,29 @@ class PortfolioRisk:
         qty: float,
         strategy: str = "unknown",
     ):
-        sl_mult = (1 - config.STOP_LOSS_PCT / 100)  if side == "BUY" else (1 + config.STOP_LOSS_PCT / 100)
-        tp_mult = (1 + config.TAKE_PROFIT_PCT / 100) if side == "BUY" else (1 - config.TAKE_PROFIT_PCT / 100)
+        leverage = getattr(config, "LEVERAGE", 1)
+        # Price needs to move SL_PCT/leverage to cause SL_PCT account loss
+        sl_price_pct = config.STOP_LOSS_PCT  / leverage
+        tp_price_pct = config.TAKE_PROFIT_PCT / leverage
+        sl_mult = (1 - sl_price_pct / 100) if side == "BUY" else (1 + sl_price_pct / 100)
+        tp_mult = (1 + tp_price_pct / 100) if side == "BUY" else (1 - tp_price_pct / 100)
+        margin  = (price * qty) / leverage  # actual capital locked
+
         async with self._lock:
             self._open_trades[symbol] = TradeRecord(
                 symbol=symbol, side=side, entry_price=price, quantity=qty,
+                margin=margin,
                 stop_loss=price * sl_mult, take_profit=price * tp_mult,
+                leverage=leverage,
                 strategy=strategy,
-                peak_price=price,  # initialize peak to entry
+                peak_price=price,
             )
+            # Lock margin from available capital
+            self._capital -= margin
         logger.info(
             f"[RISK] Opened {side} {qty:.6f} {symbol} @ {price:.4f} "
-            f"SL={price*sl_mult:.4f} TP={price*tp_mult:.4f} via {strategy}"
+            f"SL={price*sl_mult:.4f} TP={price*tp_mult:.4f} "
+            f"leverage={leverage}x margin={margin:.2f} via {strategy}"
         )
 
     async def record_close(self, symbol: str, exit_price: float) -> float:
@@ -255,7 +274,8 @@ class PortfolioRisk:
             t.hold_seconds = time.time() - t.entry_time
             t.open         = False
             self._closed_trades.append(t)
-            self._capital += pnl
+            # Return margin + PnL to capital
+            self._capital += t.margin + pnl
             self._peak_capital = max(self._peak_capital, self._capital)
             self._reset_daily_if_needed()
 
@@ -303,19 +323,23 @@ class PortfolioRisk:
         total_pnl  = sum(t.pnl for t in self._closed_trades)
         win_trades = [t for t in self._closed_trades if t.pnl > 0]
         win_rate   = len(win_trades) / len(self._closed_trades) if self._closed_trades else 0
-        drawdown   = (self._peak_capital - self._capital) / self._peak_capital * 100
+        locked_margin = sum(t.margin for t in self._open_trades.values())
+        equity     = self._capital + locked_margin
+        drawdown   = (self._peak_capital - equity) / self._peak_capital * 100
         avg_hold   = (
             sum(t.hold_seconds for t in self._closed_trades) / len(self._closed_trades) / 60
             if self._closed_trades else 0
         )
         return {
             "capital":      round(self._capital, 2),
+            "equity":       round(equity, 2),
             "total_pnl":    round(total_pnl, 4),
             "trade_count":  len(self._closed_trades),
             "win_rate":     round(win_rate, 3),
             "open_count":   len(self._open_trades),
-            "drawdown_pct": round(drawdown, 2),
+            "drawdown_pct": round(max(0, drawdown), 2),
             "avg_hold_min": round(avg_hold, 1),
             "halted":       self._halted,
             "halt_reason":  self._halt_reason,
+            "leverage":     getattr(config, "LEVERAGE", 1),
         }

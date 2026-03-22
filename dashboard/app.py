@@ -102,6 +102,8 @@ async def positions():
             "trail_active":   pos.trail_active,
             "trail_stop":     round(pos.trail_stop, 4) if pos.trail_active else None,
             "strategy":       pos.strategy,
+            "leverage":       pos.leverage,
+            "margin":         round(pos.margin, 2),
         }
     return result
 
@@ -273,6 +275,7 @@ async def ws_endpoint(ws: WebSocket):
                 "votes":           votes,
                 "cb_open":         any_open,
                 "alerts":          _alerts[-3:],
+                "leverage":        summary.get("leverage", 1),
             }))
     except WebSocketDisconnect:
         pass

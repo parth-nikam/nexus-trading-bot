@@ -22,6 +22,13 @@ MAX_POSITIONS   = 3
 SLIPPAGE_BPS    = 5
 MIN_AGREEING    = 1         # minimum strategies that must agree to fire signal
 
+# ── Leverage ──────────────────────────────────────────────────────────────────
+LEVERAGE        = int(os.getenv("LEVERAGE", "3"))   # 1 = no leverage, 3 = 3x, etc.
+# SL/TP are expressed as % of price move. With leverage, the effective
+# account-level loss is LEVERAGE × price_move_pct, so we tighten the
+# price-level SL/TP accordingly so the account risk stays the same.
+# e.g. 1.5% SL at 3x leverage → price only needs to move 0.5% to hit SL.
+
 # ── Risk ──────────────────────────────────────────────────────────────────────
 STOP_LOSS_PCT      = 1.5
 TAKE_PROFIT_PCT    = 3.0
@@ -60,6 +67,7 @@ def validate():
     assert INITIAL_CAPITAL > 0,         f"INITIAL_CAPITAL must be > 0"
     assert 0 < BUY_THRESHOLD <= 1.0,    f"BUY_THRESHOLD must be 0-1"
     assert len(SYMBOLS) > 0,            "SYMBOLS must not be empty"
+    assert 1 <= LEVERAGE <= 20,         f"LEVERAGE must be 1-20, got {LEVERAGE}"
     if not PAPER_TRADING:
         assert BINANCE_API_KEY,    "BINANCE_API_KEY required for live trading"
         assert BINANCE_API_SECRET, "BINANCE_API_SECRET required for live trading"

@@ -78,6 +78,7 @@ table.bt td{padding:5px 10px;border-top:1px solid var(--border)}
   <span class="tag" id="statusTag">connecting...</span>
   <span class="mode-badge mode-paper" id="modeBadge">PAPER</span>
   <span class="halt-badge" id="haltBadge">⚠ HALTED</span>
+  <span class="mode-badge" id="leverageBadge" style="background:rgba(188,140,255,.15);color:var(--purple)">3x</span>
   <div class="prices">
     <div class="px"><div class="sym">BTC/USDT</div><div class="val" id="pBTC">—</div><div class="chg" id="cBTC"></div></div>
     <div class="px"><div class="sym">ETH/USDT</div><div class="val" id="pETH">—</div><div class="chg" id="cETH"></div></div>
@@ -101,8 +102,8 @@ table.bt td{padding:5px 10px;border-top:1px solid var(--border)}
     <div class="sb-section">
       <div class="sb-title">Open Positions</div>
       <table class="pos-table">
-        <thead><tr><th>Sym</th><th>Side</th><th>PnL</th></tr></thead>
-        <tbody id="tPos"><tr><td colspan="3" style="color:var(--muted);padding:6px 8px;font-size:11px">None</td></tr></tbody>
+        <thead><tr><th>Sym</th><th>Side</th><th>PnL</th><th>Lev</th></tr></thead>
+        <tbody id="tPos"><tr><td colspan="4" style="color:var(--muted);padding:6px 8px;font-size:11px">None</td></tr></tbody>
       </table>
     </div>
 
@@ -294,6 +295,9 @@ function connectWS() {
     haltBadge.style.display = d.halted ? 'inline-block' : 'none';
     if (d.halted) haltBadge.title = d.halt_reason;
 
+    // Leverage badge
+    if (d.leverage) document.getElementById('leverageBadge').textContent = d.leverage + 'x';
+
     // Equity
     if (d.equity_point) equitySeries.update(d.equity_point);
 
@@ -334,8 +338,9 @@ async function refreshTables() {
           <td>${sym.replace('USDT','')}</td>
           <td style="color:${p.side==='BUY'?'var(--green)':'var(--red)'}">${p.side}</td>
           <td style="color:${(p.unrealized_pnl??0)>=0?'var(--green)':'var(--red)'}">${(p.unrealized_pnl??0).toFixed(3)}</td>
+          <td style="color:var(--purple)">${p.leverage??1}x</td>
         </tr>`).join('')
-      : '<tr><td colspan="3" style="color:var(--muted);padding:6px 8px;font-size:11px">None</td></tr>';
+      : '<tr><td colspan="4" style="color:var(--muted);padding:6px 8px;font-size:11px">None</td></tr>';
 
     const recent = trades.slice(-12).reverse();
     document.getElementById('tTrades').innerHTML = recent.length
