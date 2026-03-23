@@ -1,57 +1,75 @@
 """
-backtest.py — Historical strategy backtester for Nexus.
+backtest.py — Nexus backtester (v3)
 
-Replays OHLCV data through the live alpha engine + risk manager.
-Produces: equity curve, trade log, per-strategy metrics, Sharpe, max drawdown.
+Uses 1h candles, ATR-based SL/TP, 2-bar no-stop zone, trailing stop.
+Sharpe computed from daily equity returns (not per-trade).
 
 Usage:
-    python backtest.py --symbol BTCUSDT --interval 5m --days 30
-    python backtest.py --symbol ETHUSDT --interval 1h --days 90 --capital 5000
-    python backtest.py --symbol BTCUSDT --interval 5m --days 60 --walk-forward
+    python backtest.py --symbol BTCUSDT --days 90
+    python backtest.py --symbol ETHUSDT --days 30
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import math
 import time
-from datetime import datetime, timedelta
-from pathlib import Path
+from typing import Optional
 
 import aiohttp
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 import config
-from alpha.engine import AlphaEngine, Signal
-from execution.risk import PortfolioRisk
+from alpha.engine import AlphaEngine
 from utils.logger import get_logger
 
 logger = get_logger("nexus.backtest")
 
 BINANCE_PUBLIC = "https://api.binance.com"
 
+# ── Constants (mirrors cmd/backtest/main.go) ──────────────────────────────────
+WARMUP        = 215   # bars needed for EMA200 + indicators
+BARS_PER_DAY  = 24    # 1h candles
+FEE_RATE      = 0.0008
+MIN_HOLD_BARS = 3
+MAX_HOLD_BARS = 72
+NO_STOP_BARS  = 2     # no SL check for first 2 bars after entry
 
-async def fetch_historical(
+# ATR-based SL/TP with percentage caps
+SL_ATR_MULT = 2.0
+TP_ATR_MULT = 3.5
+SL_MIN_PCT  = 0.012
+SL_MAX_PCT  = 0.040
+TP_MIN_PCT  = 0.025
+TP_MAX_PCT  = 0.090
+TRAIL_PCT   = 0.030
+
+
+# ── Data fetching ─────────────────────────────────────────────────────────────
+
+async def fetch_candles(
     symbol: str,
-    interval: str,
     days: int,
     session: aiohttp.ClientSession,
+    interval: str = "1h",
 ) -> pd.DataFrame:
-    """Fetch full historical OHLCV from Binance (handles pagination)."""
-    end_ms   = int(time.time() * 1000)
-    start_ms = end_ms - days * 86_400_000
-    all_rows = []
+    needed    = days * BARS_PER_DAY + WARMUP
+    end_ms    = int(time.time() * 1000)
+    all_rows: list = []
 
-    logger.info(f"Fetching {days}d of {interval} candles for {symbol}...")
+    logger.info(f"Fetching {needed} {interval} candles for {symbol}...")
 
-    while start_ms < end_ms:
+    while len(all_rows) < needed:
+        batch = min(1000, needed - len(all_rows))
+        params: dict = {"symbol": symbol, "interval": interval, "limit": batch}
+        if all_rows:
+            params["endTime"] = all_rows[0][0] - 1  # walk backwards
+
         async with session.get(
             f"{BINANCE_PUBLIC}/api/v3/klines",
-            params={"symbol": symbol, "interval": interval,
-                    "startTime": start_ms, "limit": 1000},
+            params=params,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as r:
             r.raise_for_status()
@@ -59,325 +77,326 @@ async def fetch_historical(
 
         if not rows:
             break
+        all_rows = rows + all_rows
+        if len(rows) < batch:
+            break
 
-        all_rows.extend(rows)
-        start_ms = rows[-1][0] + 1
-        await asyncio.sleep(0.1)
+    # Trim to needed
+    if len(all_rows) > needed:
+        all_rows = all_rows[-needed:]
 
     df = pd.DataFrame(all_rows, columns=[
-        "time","open","high","low","close","volume",
-        "close_time","qav","trades","tbbav","tbqav","ignore"
+        "time", "open", "high", "low", "close", "volume",
+        "close_time", "qav", "trades", "tbbav", "tbqav", "ignore",
     ])
-    for col in ("open","high","low","close","volume"):
+    for col in ("open", "high", "low", "close", "volume"):
         df[col] = df[col].astype(float)
     df["time"] = pd.to_datetime(df["time"], unit="ms")
-    df = df.set_index("time").sort_index()
-    logger.info(f"Fetched {len(df)} candles ({df.index[0]} → {df.index[-1]})")
+    df = df.set_index("time").sort_index().reset_index(drop=True)
+    logger.info(f"Fetched {len(df)} candles")
     return df
 
 
-class BacktestEngine:
+# ── ATR helper ────────────────────────────────────────────────────────────────
 
-    WARMUP = 100   # candles needed before first signal
+def compute_atr(df: pd.DataFrame, i: int, period: int = 14) -> float:
+    """Wilder ATR at bar i."""
+    if i < period:
+        return 0.0
+    hi = df["high"].values
+    lo = df["low"].values
+    cl = df["close"].values
+    trs = []
+    for j in range(1, i + 1):
+        tr = max(hi[j] - lo[j], abs(hi[j] - cl[j - 1]), abs(lo[j] - cl[j - 1]))
+        trs.append(tr)
+    # Wilder smoothing
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
 
-    def __init__(self, capital: float = 10_000.0):
-        self._alpha   = AlphaEngine()
-        self._capital = capital
-        self._equity: list[dict] = []
-        self._trades: list[dict] = []
 
-    def run(self, symbol: str, df: pd.DataFrame) -> dict:
-        logger.info(f"Running backtest on {len(df)} candles...")
-        capital  = self._capital
-        position = None
+# ── Core backtest ─────────────────────────────────────────────────────────────
 
-        for i in range(self.WARMUP, len(df)):
-            window = df.iloc[i - self.WARMUP: i + 1].reset_index(drop=True)
-            price  = float(window["close"].iloc[-1])
-            ts     = df.index[i]
+def run_backtest(df: pd.DataFrame, capital: float = 10_000.0) -> dict:
+    if len(df) < WARMUP + 10:
+        return {"error": f"not enough candles: {len(df)}"}
 
-            # Check exit on open position
-            if position:
-                high = float(window["high"].iloc[-1])
-                low  = float(window["low"].iloc[-1])
+    engine = AlphaEngine()
 
-                # Update trailing stop
-                trail_pct = getattr(config, "TRAILING_STOP_PCT", 1.0) / 100
-                if position["side"] == "BUY":
-                    if high > position.get("peak", position["entry"]):
-                        position["peak"] = high
-                    if position.get("trail_active"):
-                        new_trail = position["peak"] * (1 - trail_pct)
-                        if new_trail > position.get("trail_stop", 0):
-                            position["trail_stop"] = new_trail
-                    elif (high - position["entry"]) / position["entry"] >= trail_pct:
-                        position["trail_active"] = True
-                        position["trail_stop"]   = position["peak"] * (1 - trail_pct)
-                else:
-                    if low < position.get("peak", position["entry"]):
-                        position["peak"] = low
-                    if position.get("trail_active"):
-                        new_trail = position["peak"] * (1 + trail_pct)
-                        if position.get("trail_stop", 0) == 0 or new_trail < position["trail_stop"]:
-                            position["trail_stop"] = new_trail
-                    elif (position["entry"] - low) / position["entry"] >= trail_pct:
-                        position["trail_active"] = True
-                        position["trail_stop"]   = position["peak"] * (1 + trail_pct)
+    # Pre-compute signals
+    signals: list[Optional[tuple]] = [None] * len(df)
+    dist = {"BUY": 0, "SELL": 0, "HOLD": 0}
+    for i in range(WARMUP, len(df)):
+        window = df.iloc[: i + 1].copy()
+        sig = engine.evaluate("BT", window)
+        signals[i] = (sig.action, sig.score, sig.agreeing)
+        dist[sig.action] += 1
 
-                # Determine effective stop
-                eff_stop = position.get("trail_stop", position["sl"]) if position.get("trail_active") else position["sl"]
+    logger.info(f"Signal dist — BUY={dist['BUY']} SELL={dist['SELL']} HOLD={dist['HOLD']}")
 
-                hit_sl = (position["side"] == "BUY"  and low  <= eff_stop) or \
-                         (position["side"] == "SELL" and high >= eff_stop)
-                hit_tp = (position["side"] == "BUY"  and high >= position["tp"]) or \
-                         (position["side"] == "SELL" and low  <= position["tp"])
+    peak    = capital
+    max_dd  = 0.0
+    lev     = float(getattr(config, "LEVERAGE", 3))
+    size_pct = getattr(config, "TRADE_SIZE_PCT", 0.20)
 
-                if hit_sl or hit_tp:
-                    exit_price = eff_stop if hit_sl else position["tp"]
-                    mult = 1 if position["side"] == "BUY" else -1
-                    pnl  = mult * (exit_price - position["entry"]) * position["qty"]
-                    fee  = exit_price * position["qty"] * 0.001
-                    capital += pnl - fee
-                    reason = ("trail_stop" if position.get("trail_active") else "stop_loss") if hit_sl else "take_profit"
-                    self._trades.append({
-                        "symbol":     symbol,
-                        "side":       position["side"],
-                        "entry":      position["entry"],
-                        "exit":       exit_price,
-                        "qty":        position["qty"],
-                        "pnl":        round(pnl - fee, 4),
-                        "reason":     reason,
-                        "strategy":   position["strategy"],
-                        "entry_time": position["entry_time"],
-                        "exit_time":  str(ts),
-                        "hold_bars":  i - position["entry_idx"],
-                        "trail_used": position.get("trail_active", False),
-                    })
-                    self._alpha.record_outcome(position["strategy"], pnl > 0)
-                    position = None
-                    self._equity.append({"time": str(ts), "value": round(capital, 2)})
-                    continue
+    trades: list[dict] = []
+    equity_series = [capital] * len(df)
 
-            # Run alpha engine
-            signal = self._alpha.evaluate(symbol, window)
+    # Position state
+    in_trade       = False
+    open_price     = 0.0
+    open_notional  = 0.0
+    open_side      = ""
+    open_bar       = 0
+    open_sl        = 0.0
+    open_tp        = 0.0
+    open_atr       = 0.0
+    trail_active   = False
+    breakeven_active = False
+    peak_price     = 0.0
+    trail_stop     = 0.0
 
-            if signal.action != "HOLD" and position is None:
-                qty = capital * signal.kelly_f / price
-                if qty <= 0:
-                    continue
-                sl_mult = (1 - config.STOP_LOSS_PCT / 100)  if signal.action == "BUY" else (1 + config.STOP_LOSS_PCT / 100)
-                tp_mult = (1 + config.TAKE_PROFIT_PCT / 100) if signal.action == "BUY" else (1 - config.TAKE_PROFIT_PCT / 100)
-                fee = price * qty * 0.001
-                capital -= fee
-                position = {
-                    "side":       signal.action,
-                    "entry":      price,
-                    "qty":        qty,
-                    "sl":         price * sl_mult,
-                    "tp":         price * tp_mult,
-                    "peak":       price,
-                    "trail_active": False,
-                    "trail_stop": 0.0,
-                    "strategy":   signal.reason.split("|")[0].strip() if signal.reason else "alpha",
-                    "entry_time": str(ts),
-                    "entry_idx":  i,
-                }
+    def close_trade(exit_price: float, bar: int, reason: str):
+        nonlocal capital, peak, max_dd, in_trade
+        nonlocal trail_active, breakeven_active, peak_price, trail_stop
 
-            self._equity.append({"time": str(ts), "value": round(capital, 2)})
-
-        # Close any open position at end
-        if position:
-            price = float(df["close"].iloc[-1])
-            mult  = 1 if position["side"] == "BUY" else -1
-            pnl   = mult * (price - position["entry"]) * position["qty"]
-            fee   = price * position["qty"] * 0.001
-            capital += pnl - fee
-            self._trades.append({
-                "symbol":   symbol, "side": position["side"],
-                "entry":    position["entry"], "exit": price,
-                "qty":      position["qty"], "pnl": round(pnl - fee, 4),
-                "reason":   "end_of_data", "strategy": position["strategy"],
-                "entry_time": position["entry_time"], "exit_time": str(df.index[-1]),
-                "hold_bars": len(df) - position["entry_idx"],
-                "trail_used": position.get("trail_active", False),
-            })
-
-        return self._compute_stats(capital)
-
-    def _compute_stats(self, final_capital: float) -> dict:
-        trades = self._trades
-        equity = [e["value"] for e in self._equity]
-
-        if not trades:
-            return {"error": "no trades generated"}
-
-        pnls      = [t["pnl"] for t in trades]
-        wins      = [p for p in pnls if p > 0]
-        losses    = [p for p in pnls if p <= 0]
-        win_rate  = len(wins) / len(pnls)
-        total_pnl = sum(pnls)
-        avg_win   = sum(wins) / len(wins) if wins else 0
-        avg_loss  = sum(losses) / len(losses) if losses else 0
-        profit_factor = abs(sum(wins) / sum(losses)) if losses and sum(losses) != 0 else float("inf")
-
-        # Expectancy per trade
-        expectancy = (win_rate * avg_win) + ((1 - win_rate) * avg_loss)
-
-        # Sharpe (annualized)
-        candles_per_day = {"1m": 1440, "3m": 480, "5m": 288, "15m": 96,
-                           "30m": 48, "1h": 24, "4h": 6, "1d": 1}
-        interval = getattr(self, "_interval", "5m")
-        cpd = candles_per_day.get(interval, 288)
-        if len(pnls) > 1:
-            mean_pnl = total_pnl / len(pnls)
-            std_pnl  = math.sqrt(sum((p - mean_pnl)**2 for p in pnls) / len(pnls))
-            sharpe   = (mean_pnl / std_pnl * math.sqrt(cpd * 365)) if std_pnl > 0 else 0
+        fee = open_notional * FEE_RATE * 2
+        if open_side == "BUY":
+            pnl = (exit_price - open_price) / open_price * open_notional - fee
         else:
-            sharpe = 0
+            pnl = (open_price - exit_price) / open_price * open_notional - fee
 
-        # Sortino (downside deviation only)
-        neg_pnls = [p for p in pnls if p < 0]
-        if neg_pnls and len(pnls) > 1:
-            mean_pnl   = total_pnl / len(pnls)
-            down_var   = sum(p**2 for p in neg_pnls) / len(pnls)
-            down_std   = math.sqrt(down_var)
-            sortino    = (mean_pnl / down_std * math.sqrt(cpd * 365)) if down_std > 0 else 0
-        else:
-            sortino = 0
+        capital += pnl
+        hold = bar - open_bar
+        trades.append({
+            "side": open_side, "entry": open_price, "exit": exit_price,
+            "pnl": round(pnl, 4), "hold": hold, "reason": reason,
+        })
+        if capital > peak:
+            peak = capital
+        dd = (peak - capital) / peak * 100
+        if dd > max_dd:
+            max_dd = dd
 
-        # Max drawdown
-        peak   = self._capital
-        max_dd = 0.0
-        for v in equity:
-            peak   = max(peak, v)
-            max_dd = max(max_dd, (peak - v) / peak * 100)
+        logger.info(
+            f"CLOSE {open_side} bar={bar} entry={open_price:.2f} exit={exit_price:.2f} "
+            f"pnl={pnl:+.2f} hold={hold} [{reason}] cap={capital:.2f}"
+        )
+        in_trade = trail_active = breakeven_active = False
+        peak_price = trail_stop = 0.0
 
-        # Calmar ratio
-        calmar = (final_capital - self._capital) / self._capital * 100 / max_dd if max_dd > 0 else 0
+    for i in range(WARMUP, len(df)):
+        c = df.iloc[i]
+        equity_series[i] = capital
 
-        # Consecutive wins/losses
-        max_consec_wins   = 0
-        max_consec_losses = 0
-        cur_w = cur_l = 0
-        for p in pnls:
-            if p > 0:
-                cur_w += 1; cur_l = 0
-                max_consec_wins = max(max_consec_wins, cur_w)
+        if in_trade:
+            # Update trailing stop
+            if open_side == "BUY":
+                if c["high"] > peak_price:
+                    peak_price = c["high"]
+                profit_pct = (peak_price - open_price) / open_price
+                if not breakeven_active and open_atr > 0 and (c["high"] - open_price) >= open_atr * 3.0:
+                    breakeven_active = True
+                    be_level = open_price * 1.001
+                    if open_sl < be_level:
+                        open_sl = be_level
+                if profit_pct >= TRAIL_PCT:
+                    trail_active = True
+                    new_trail = peak_price * (1 - TRAIL_PCT)
+                    if new_trail > trail_stop:
+                        trail_stop = new_trail
             else:
-                cur_l += 1; cur_w = 0
-                max_consec_losses = max(max_consec_losses, cur_l)
+                if peak_price == 0 or c["low"] < peak_price:
+                    peak_price = c["low"]
+                profit_pct = (open_price - peak_price) / open_price
+                if not breakeven_active and open_atr > 0 and (open_price - c["low"]) >= open_atr * 3.0:
+                    breakeven_active = True
+                    be_level = open_price * 0.999
+                    if open_sl > be_level:
+                        open_sl = be_level
+                if profit_pct >= TRAIL_PCT:
+                    trail_active = True
+                    new_trail = peak_price * (1 + TRAIL_PCT)
+                    if trail_stop == 0 or new_trail < trail_stop:
+                        trail_stop = new_trail
 
+            sl = trail_stop if trail_active else open_sl
+            no_stop_zone = (i - open_bar) < NO_STOP_BARS
+
+            if open_side == "BUY":
+                if not no_stop_zone and c["low"] <= sl:
+                    exit_p = sl if c["open"] >= sl else c["open"]
+                    close_trade(exit_p, i, "stop_loss")
+                    continue
+                if c["high"] >= open_tp:
+                    close_trade(open_tp, i, "take_profit")
+                    continue
+            else:
+                if not no_stop_zone and c["high"] >= sl:
+                    exit_p = sl if c["open"] <= sl else c["open"]
+                    close_trade(exit_p, i, "stop_loss")
+                    continue
+                if c["low"] <= open_tp:
+                    close_trade(open_tp, i, "take_profit")
+                    continue
+
+            if i - open_bar >= MAX_HOLD_BARS:
+                close_trade(c["close"], i, "max_hold")
+                continue
+
+            if i - open_bar >= MIN_HOLD_BARS and signals[i]:
+                action, score, _ = signals[i]
+                if (open_side == "BUY" and action == "SELL" and score > 0.35) or \
+                   (open_side == "SELL" and action == "BUY" and score > 0.35):
+                    close_trade(c["close"], i, "signal_flip")
+                    continue
+
+        if not in_trade and signals[i]:
+            action, score, _ = signals[i]
+            if action in ("BUY", "SELL"):
+                margin = capital * size_pct
+                if margin <= 0:
+                    continue
+
+                open_notional = margin * lev
+                open_price    = c["close"]
+                open_side     = action
+
+                atr = compute_atr(df, i, 14)
+                if atr == 0:
+                    atr = open_price * 0.01
+
+                sl_dist = max(open_price * SL_MIN_PCT, min(open_price * SL_MAX_PCT, atr * SL_ATR_MULT))
+                tp_dist = max(open_price * TP_MIN_PCT, min(open_price * TP_MAX_PCT, atr * TP_ATR_MULT))
+
+                if action == "BUY":
+                    open_sl = open_price - sl_dist
+                    open_tp = open_price + tp_dist
+                else:
+                    open_sl = open_price + sl_dist
+                    open_tp = open_price - tp_dist
+
+                open_bar       = i
+                open_atr       = atr
+                in_trade       = True
+                peak_price     = open_price
+                trail_active   = False
+                breakeven_active = False
+                trail_stop     = 0.0
+                capital       -= open_notional * FEE_RATE
+
+                sl_pct = abs(open_sl - open_price) / open_price * 100
+                tp_pct = abs(open_tp - open_price) / open_price * 100
+                logger.info(
+                    f"OPEN {action} bar={i} price={open_price:.2f} notional={open_notional:.2f} "
+                    f"score={score:.3f} SL={open_sl:.2f}({sl_pct:.2f}%) TP={open_tp:.2f}({tp_pct:.2f}%) cap={capital:.2f}"
+                )
+
+    if in_trade:
+        close_trade(df.iloc[-1]["close"], len(df) - 1, "end_of_data")
+
+    return _compute_stats(trades, equity_series, capital, 10_000.0, max_dd, dist)
+
+
+def _compute_stats(
+    trades: list[dict],
+    equity_series: list[float],
+    final_capital: float,
+    initial_capital: float,
+    max_dd: float,
+    dist: dict,
+) -> dict:
+    n = len(trades)
+    if n == 0:
         return {
-            "symbol":              trades[0]["symbol"] if trades else "?",
-            "initial_capital":     self._capital,
-            "final_capital":       round(final_capital, 2),
-            "total_pnl":           round(total_pnl, 4),
-            "return_pct":          round((final_capital - self._capital) / self._capital * 100, 2),
-            "trade_count":         len(trades),
-            "win_rate":            round(win_rate, 3),
-            "avg_win":             round(avg_win, 4),
-            "avg_loss":            round(avg_loss, 4),
-            "expectancy":          round(expectancy, 4),
-            "profit_factor":       round(profit_factor, 3),
-            "sharpe":              round(sharpe, 3),
-            "sortino":             round(sortino, 3),
-            "calmar":              round(calmar, 3),
-            "max_drawdown":        round(max_dd, 2),
-            "avg_hold_bars":       round(sum(t["hold_bars"] for t in trades) / len(trades), 1),
-            "max_consec_wins":     max_consec_wins,
-            "max_consec_losses":   max_consec_losses,
-            "trail_stop_exits":    sum(1 for t in trades if t.get("trail_used")),
+            "return_pct": 0.0, "trade_count": 0, "win_rate": 0.0,
+            "sharpe": 0.0, "max_drawdown": 0.0, "profit_factor": 0.0,
+            "avg_hold_bars": 0.0, "final_capital": round(final_capital, 2),
+            "gross_wins": 0.0, "gross_losses": 0.0, "signal_dist": dist,
         }
 
+    wins = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+    gross_w = sum(t["pnl"] for t in wins)
+    gross_l = sum(abs(t["pnl"]) for t in losses)
+    total_hold = sum(t["hold"] for t in trades)
 
-def walk_forward(
-    symbol: str,
-    df: pd.DataFrame,
-    capital: float,
-    n_splits: int = 5,
-) -> list[dict]:
-    """
-    Walk-forward validation: split data into n_splits windows,
-    train on first 70%, test on last 30% of each window.
-    Returns list of out-of-sample stats.
-    """
-    results = []
-    split_size = len(df) // n_splits
+    wr = len(wins) / n
+    avg_hold = total_hold / n
+    pf = gross_w / gross_l if gross_l > 0 else (99.0 if gross_w > 0 else 0.0)
+    ret_pct = (final_capital - initial_capital) / initial_capital * 100
 
-    for i in range(n_splits):
-        start = i * split_size
-        end   = start + split_size
-        if end > len(df):
-            end = len(df)
-        window_df = df.iloc[start:end]
-        if len(window_df) < 200:
-            continue
+    # Sharpe: daily equity returns (24 bars/day for 1h candles)
+    sharpe = 0.0
+    trading_bars = len(equity_series) - WARMUP
+    if trading_bars >= BARS_PER_DAY * 2:
+        num_days = trading_bars // BARS_PER_DAY
+        daily_rets = []
+        for d in range(num_days):
+            s = WARMUP + d * BARS_PER_DAY
+            e = min(s + BARS_PER_DAY - 1, len(equity_series) - 1)
+            if equity_series[s] > 0:
+                daily_rets.append((equity_series[e] - equity_series[s]) / equity_series[s])
+        if len(daily_rets) >= 2:
+            mean = sum(daily_rets) / len(daily_rets)
+            variance = sum((r - mean) ** 2 for r in daily_rets) / len(daily_rets)
+            std = math.sqrt(variance)
+            if std > 0:
+                sharpe = mean / std * math.sqrt(252)
 
-        engine = BacktestEngine(capital=capital)
-        engine._interval = "5m"
-        stats  = engine.run(symbol, window_df)
-        stats["window"] = i + 1
-        stats["start"]  = str(window_df.index[0])
-        stats["end"]    = str(window_df.index[-1])
-        results.append(stats)
-        logger.info(f"Walk-forward window {i+1}/{n_splits}: {stats.get('return_pct', 'N/A')}% return")
+    exit_reasons: dict[str, int] = {}
+    for t in trades:
+        exit_reasons[t["reason"]] = exit_reasons.get(t["reason"], 0) + 1
 
-    return results
+    logger.info(
+        f"DONE trades={n} wins={len(wins)} wr={wr*100:.1f}% "
+        f"return={ret_pct:.2f}% PF={pf:.2f} sharpe={sharpe:.2f} maxDD={max_dd:.2f}%"
+    )
+
+    return {
+        "return_pct":    round(ret_pct, 2),
+        "trade_count":   n,
+        "win_rate":      round(wr, 3),
+        "sharpe":        round(sharpe, 2),
+        "max_drawdown":  round(max_dd, 2),
+        "profit_factor": round(pf, 2),
+        "avg_hold_bars": round(avg_hold, 1),
+        "final_capital": round(final_capital, 2),
+        "gross_wins":    round(gross_w, 2),
+        "gross_losses":  round(gross_l, 2),
+        "signal_dist":   dist,
+        "exit_reasons":  exit_reasons,
+    }
 
 
-def print_report(stats: dict, trades: list):
-    print("\n" + "=" * 60)
-    print("  NEXUS BACKTEST REPORT")
-    print("=" * 60)
-    for k, v in stats.items():
-        print(f"  {k:<26} {v}")
-    print("=" * 60)
+# ── Dashboard-callable wrapper ────────────────────────────────────────────────
 
-    if trades:
-        print(f"\n  Last 5 trades:")
-        for t in trades[-5:]:
-            pnl_str = f"{t['pnl']:+.4f}"
-            trail   = " [trail]" if t.get("trail_used") else ""
-            print(f"  {t['side']:<4} {t['entry']:.2f}→{t['exit']:.2f} "
-                  f"pnl={pnl_str} [{t['reason']}]{trail} {t['strategy'][:20]}")
-    print()
+async def run_backtest_async(symbol: str, days: int) -> dict:
+    async with aiohttp.ClientSession() as session:
+        df = await fetch_candles(symbol, days, session)
+    return run_backtest(df)
 
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 async def main():
     parser = argparse.ArgumentParser(description="Nexus Backtester")
-    parser.add_argument("--symbol",       default="BTCUSDT")
-    parser.add_argument("--interval",     default="5m")
-    parser.add_argument("--days",         type=int, default=30)
-    parser.add_argument("--capital",      type=float, default=10_000.0)
-    parser.add_argument("--output",       default=None, help="Save results to JSON file")
-    parser.add_argument("--walk-forward", action="store_true", help="Run walk-forward validation")
+    parser.add_argument("--symbol", default="BTCUSDT")
+    parser.add_argument("--days",   type=int, default=90)
     args = parser.parse_args()
 
     async with aiohttp.ClientSession() as session:
-        df = await fetch_historical(args.symbol, args.interval, args.days, session)
+        df = await fetch_candles(args.symbol, args.days, session)
 
-    if args.walk_forward:
-        print(f"\nRunning walk-forward validation ({5} windows)...")
-        results = walk_forward(args.symbol, df, args.capital)
-        for r in results:
-            print(f"\n  Window {r['window']} ({r['start'][:10]} → {r['end'][:10]})")
-            print(f"    Return: {r.get('return_pct', 'N/A')}% | "
-                  f"Trades: {r.get('trade_count', 0)} | "
-                  f"WinRate: {r.get('win_rate', 0):.1%} | "
-                  f"Sharpe: {r.get('sharpe', 0):.2f} | "
-                  f"MaxDD: {r.get('max_drawdown', 0):.1f}%")
-        if args.output:
-            Path(args.output).write_text(json.dumps(results, indent=2))
-    else:
-        engine = BacktestEngine(capital=args.capital)
-        engine._interval = args.interval
-        stats  = engine.run(args.symbol, df)
-        print_report(stats, engine._trades)
-
-        if args.output:
-            out = {"stats": stats, "trades": engine._trades, "equity": engine._equity}
-            Path(args.output).write_text(json.dumps(out, indent=2))
-            logger.info(f"Results saved to {args.output}")
+    stats = run_backtest(df)
+    print(f"\n{'='*50}")
+    print(f"  NEXUS BACKTEST — {args.symbol} {args.days}d (1h candles)")
+    print(f"{'='*50}")
+    for k, v in stats.items():
+        print(f"  {k:<20} {v}")
+    print(f"{'='*50}\n")
 
 
 if __name__ == "__main__":

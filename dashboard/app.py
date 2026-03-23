@@ -141,21 +141,13 @@ async def alerts():
 
 @app.post("/api/backtest")
 async def run_backtest(body: dict):
-    """Trigger a quick backtest from the dashboard."""
-    symbol   = body.get("symbol", "BTCUSDT").upper()
-    interval = body.get("interval", "5m")
-    days     = int(body.get("days", 7))
-
-    async def _run():
-        import aiohttp as _aiohttp
-        from backtest import fetch_historical, BacktestEngine
-        async with _aiohttp.ClientSession() as session:
-            df = await fetch_historical(symbol, interval, days, session)
-        engine = BacktestEngine(capital=10_000)
-        return engine.run(symbol, df)
+    """Trigger a quick backtest from the dashboard (1h candles, ATR SL/TP)."""
+    symbol = body.get("symbol", "BTCUSDT").upper()
+    days   = int(body.get("days", 30))
 
     try:
-        stats = await asyncio.wait_for(_run(), timeout=60)
+        from backtest import run_backtest_async
+        stats = await asyncio.wait_for(run_backtest_async(symbol, days), timeout=120)
         return stats
     except asyncio.TimeoutError:
         return {"error": "backtest timed out"}
